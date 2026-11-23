@@ -1,255 +1,420 @@
+
 import os
-import json
-import hmac
 import logging
-import sqlite3
-from contextlib import closing
+import secrets
+from contextlib import asynccontextmanager
 from typing import Any
 
 import httpx
-from fastapi import FastAPI, Request, HTTPException
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, Header, HTTPException, Request
 
-logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
-log = logging.getLogger("telegram-ai-assistant")
+# =========================
+# CONFIGURATION
+# =========================
 
-BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s: %(message)s"
+)
+
+log = logging.getLogger("telegram-assistant")
+
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+
+# Your Render URL
+PUBLIC_URL = os.getenv(
+    "PUBLIC_URL",
+    "https://telegram-ai-assistant-1e5s.onrender.com"
+).strip().rstrip("/")
+
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "").strip()
+ADMIN_KEY = os.getenv("ADMIN_KEY", "").strip()
+
 AUTO_REPLY = os.getenv("AUTO_REPLY", "false").lower() == "true"
-DB_PATH = os.getenv("DB_PATH", "data/assistant.sqlite3")
-MAX_HISTORY = int(os.getenv("MAX_HISTORY", "12"))
-MAX_REPLY_CHARS = int(os.getenv("MAX_REPLY_CHARS", "1800"))
 
-GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
-GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
-OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "openai/gpt-oss-20b:free")
-AI_PROVIDER_ORDER = os.getenv("AI_PROVIDER_ORDER", "groq,openrouter").split(",")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "").strip()
+
+GROQ_MODEL = os.getenv(
+    "GROQ_MODEL",
+    "llama-3.3-70b-versatile"
+)
+
+OPENROUTER_MODEL = os.getenv(
+    "OPENROUTER_MODEL",
+    "openai/gpt-4o-mini"
+)
 
 SYSTEM_PROMPT = os.getenv(
     "SYSTEM_PROMPT",
-    """Ты — помощник, который предлагает черновики ответов от имени владельца аккаунта.
-Подстраивайся под тон собеседника: будь естественным, дружелюбным и кратким.
-Не выдумывай факты о владельце, его планах, местоположении или обещаниях.
-Если вопрос требует личного решения, денег, паролей, кодов, документов,
-медицинских/юридических выводов или содержит конфликт — вежливо предложи,
-что владелец ответит сам. Не проси и не раскрывай пароли, коды входа и секреты.
-Не отправляй ссылки, файлы, рекламу или массовые сообщения.
-Отвечай на языке собеседника."""
+    "Ты дружелюбный личный AI-ассистент. "
+    "Отвечай естественно и учитывай контекст переписки."
 )
 
-app = FastAPI(title="Telegram AI Assistant", version="0.1.0")
+TELEGRAM_API = (
+    f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
+    if TELEGRAM_TOKEN else ""
+)
+
+business_connections = {}
+processed_updates = set()
 
 
-def db():
-    os.makedirs(os.path.dirname(DB_PATH) or ".", exist_ok=True)
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute("""CREATE TABLE IF NOT EXISTS messages (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        chat_id TEXT NOT NULL,
-        role TEXT NOT NULL,
-        content TEXT NOT NULL,
-        telegram_message_id TEXT,
-        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-    )""")
-    conn.execute("""CREATE TABLE IF NOT EXISTS processed (
-        message_key TEXT PRIMARY KEY,
-        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-    )""")
-    conn.commit()
-    return conn
+# =========================
+# TELEGRAM API
+# =========================
 
+async def telegram_call(method: str, payload: dict):
+    if not TELEGRAM_API:
+        raise RuntimeError("TELEGRAM_BOT_TOKEN is missing")
 
-def already_processed(key: str) -> bool:
-    with closing(db()) as conn:
-        row = conn.execute("SELECT 1 FROM processed WHERE message_key=?", (key,)).fetchone()
-        return row is not None
-
-
-def mark_processed(key: str):
-    with closing(db()) as conn:
-        conn.execute("INSERT OR IGNORE INTO processed(message_key) VALUES(?)", (key,))
-        conn.commit()
-
-
-def save_message(chat_id: str, role: str, content: str, message_id: str | None = None):
-    with closing(db()) as conn:
-        conn.execute(
-            "INSERT INTO messages(chat_id, role, content, telegram_message_id) VALUES(?,?,?,?)",
-            (chat_id, role, content[:5000], message_id),
+    async with httpx.AsyncClient(timeout=30) as client:
+        response = await client.post(
+            f"{TELEGRAM_API}/{method}",
+            json=payload
         )
-        conn.execute(
-            """DELETE FROM messages WHERE chat_id=? AND id NOT IN
-               (SELECT id FROM messages WHERE chat_id=? ORDER BY id DESC LIMIT ?)""",
-            (chat_id, chat_id, MAX_HISTORY),
+
+        response.raise_for_status()
+        data = response.json()
+
+    if not data.get("ok"):
+        raise RuntimeError(f"Telegram error: {data}")
+
+    return data
+
+
+# =========================
+# AUTOMATIC WEBHOOK
+# =========================
+
+async def register_webhook():
+    if not TELEGRAM_TOKEN:
+        log.warning("Telegram token is missing")
+        return
+
+    if not PUBLIC_URL:
+        log.warning("PUBLIC_URL is missing")
+        return
+
+    payload = {
+        "url": f"{PUBLIC_URL}/telegram/webhook",
+        "allowed_updates": [
+            "business_connection",
+            "business_message"
+        ],
+        "drop_pending_updates": False
+    }
+
+    if WEBHOOK_SECRET:
+        payload["secret_token"] = WEBHOOK_SECRET
+
+    try:
+        result = await telegram_call("setWebhook", payload)
+        log.info(
+            "Webhook registered: %s",
+            result.get("description", "OK")
         )
-        conn.commit()
+    except Exception:
+        log.exception("Webhook registration failed")
 
 
-def get_history(chat_id: str):
-    with closing(db()) as conn:
-        rows = conn.execute(
-            "SELECT role, content FROM messages WHERE chat_id=? ORDER BY id ASC",
-            (chat_id,),
-        ).fetchall()
-    return [{"role": role, "content": content} for role, content in rows]
+# =========================
+# AI ENGINE
+# =========================
 
+async def generate_reply(user_text: str) -> str:
 
-async def ask_provider(provider: str, messages: list[dict[str, str]]) -> str:
-    if provider == "groq":
-        key, model = GROQ_API_KEY, GROQ_MODEL
-        url = "https://api.groq.com/openai/v1/chat/completions"
-        headers = {"Authorization": f"Bearer {key}"}
-    elif provider == "openrouter":
-        key, model = OPENROUTER_API_KEY, OPENROUTER_MODEL
-        url = "https://openrouter.ai/api/v1/chat/completions"
-        headers = {
-            "Authorization": f"Bearer {key}",
-            "HTTP-Referer": os.getenv("APP_URL", "https://render.com"),
-            "X-Title": "Telegram AI Assistant",
+    messages = [
+        {
+            "role": "system",
+            "content": SYSTEM_PROMPT
+        },
+        {
+            "role": "user",
+            "content": user_text[:12000]
         }
-    else:
-        raise ValueError("Unknown AI provider")
+    ]
 
-    if not key:
-        raise RuntimeError(f"{provider}: API key is not configured")
+    providers = []
 
-    payload = {
-        "model": model,
-        "messages": messages,
-        "temperature": 0.7,
-        "max_tokens": 350,
-    }
-    async with httpx.AsyncClient(timeout=35) as client:
-        response = await client.post(url, headers=headers, json=payload)
-        response.raise_for_status()
-        data = response.json()
-    answer = data["choices"][0]["message"]["content"]
-    if isinstance(answer, list):
-        answer = "".join(part.get("text", "") for part in answer if isinstance(part, dict))
-    answer = str(answer).strip()
-    if not answer:
-        raise RuntimeError(f"{provider}: empty response")
-    return answer[:MAX_REPLY_CHARS]
+    if GROQ_API_KEY:
+        providers.append({
+            "name": "Groq",
+            "url": "https://api.groq.com/openai/v1/chat/completions",
+            "key": GROQ_API_KEY,
+            "model": GROQ_MODEL
+        })
 
+    if OPENROUTER_API_KEY:
+        providers.append({
+            "name": "OpenRouter",
+            "url": "https://openrouter.ai/api/v1/chat/completions",
+            "key": OPENROUTER_API_KEY,
+            "model": OPENROUTER_MODEL
+        })
 
-async def generate_reply(chat_id: str, incoming: str) -> str:
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
-    messages.extend(get_history(chat_id))
-    messages.append({"role": "user", "content": incoming})
+    last_error = None
 
-    errors = []
-    for provider in [p.strip().lower() for p in AI_PROVIDER_ORDER if p.strip()]:
+    for provider in providers:
+
+        headers = {
+            "Authorization": f"Bearer {provider['key']}",
+            "Content-Type": "application/json"
+        }
+
+        if provider["name"] == "OpenRouter":
+            headers["HTTP-Referer"] = PUBLIC_URL
+            headers["X-Title"] = "Telegram AI Assistant"
+
         try:
-            answer = await ask_provider(provider, messages)
-            log.info("AI reply generated with %s", provider)
-            return answer
-        except Exception as exc:
-            log.warning("%s provider failed: %s", provider, exc)
-            errors.append(f"{provider}: {exc}")
-    raise RuntimeError("All AI providers failed: " + "; ".join(errors))
+            async with httpx.AsyncClient(timeout=45) as client:
+                response = await client.post(
+                    provider["url"],
+                    headers=headers,
+                    json={
+                        "model": provider["model"],
+                        "messages": messages,
+                        "temperature": 0.7
+                    }
+                )
+
+                response.raise_for_status()
+                data = response.json()
+
+            answer = data["choices"][0]["message"]["content"]
+
+            if answer and answer.strip():
+                log.info("AI response generated with %s", provider["name"])
+                return answer.strip()[:4000]
+
+        except Exception as error:
+            last_error = error
+            log.warning(
+                "%s failed: %s",
+                provider["name"],
+                error
+            )
+
+    raise RuntimeError(f"All AI providers failed: {last_error}")
 
 
-async def telegram_send(chat_id: int, text: str, business_connection_id: str):
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": chat_id,
-        "text": text,
-        "business_connection_id": business_connection_id,
-    }
-    async with httpx.AsyncClient(timeout=20) as client:
-        response = await client.post(url, json=payload)
-        response.raise_for_status()
-        data = response.json()
-        if not data.get("ok"):
-            raise RuntimeError(f"Telegram API error: {data}")
-        return data
+# =========================
+# SEND BUSINESS MESSAGE
+# =========================
+
+async def send_business_reply(connection_id, chat_id, text):
+
+    chunks = [
+        text[i:i + 4000]
+        for i in range(0, len(text), 4000)
+    ]
+
+    for chunk in chunks:
+        await telegram_call(
+            "sendMessage",
+            {
+                "business_connection_id": connection_id,
+                "chat_id": chat_id,
+                "text": chunk
+            }
+        )
+
+
+# =========================
+# BUSINESS CONNECTION
+# =========================
+
+async def handle_business_connection(connection):
+
+    connection_id = connection.get("id")
+
+    if not connection_id:
+        return
+
+    if connection.get("is_enabled"):
+        business_connections[connection_id] = connection
+        log.info("Business connection enabled")
+
+    else:
+        business_connections.pop(connection_id, None)
+        log.info("Business connection disabled")
+
+
+# =========================
+# MESSAGE HANDLER
+# =========================
+
+async def handle_business_message(message):
+
+    connection_id = message.get("business_connection_id")
+    chat = message.get("chat", {})
+    chat_id = chat.get("id")
+
+    text = message.get("text") or message.get("caption") or ""
+
+    if not connection_id or not chat_id or not text.strip():
+        return
+
+    if not AUTO_REPLY:
+        log.info("AUTO_REPLY disabled")
+        return
+
+    connection = business_connections.get(connection_id)
+
+    if connection is not None:
+        rights = connection.get("rights") or {}
+
+        if not rights.get("can_reply", False):
+            log.info("No permission to reply")
+            return
+
+    sender = message.get("from", {})
+
+    if sender.get("is_bot"):
+        return
+
+    try:
+        answer = await generate_reply(text)
+
+        await send_business_reply(
+            connection_id,
+            chat_id,
+            answer
+        )
+
+    except Exception:
+        log.exception("Message processing failed")
+
+
+# =========================
+# APPLICATION LIFESPAN
+# =========================
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+
+    log.info("NEXUS TELEGRAM AI ONLINE")
+    log.info("PUBLIC_URL: %s", PUBLIC_URL)
+
+    await register_webhook()
+
+    yield
+
+    log.info("Application stopped")
+
+
+# =========================
+# FASTAPI
+# =========================
+
+app = FastAPI(
+    title="Telegram AI Assistant",
+    version="0.2.0",
+    lifespan=lifespan
+)
 
 
 @app.get("/")
 async def root():
-    return {"name": "Telegram AI Assistant", "version": "0.1.0", "status": "running"}
+
+    return {
+        "service": "Telegram AI Assistant",
+        "status": "online",
+        "version": "0.2.0"
+    }
 
 
 @app.get("/health")
 async def health():
-    return {"ok": True, "auto_reply": AUTO_REPLY}
 
+    return {
+        "ok": True,
+        "auto_reply": AUTO_REPLY,
+        "webhook_configured": bool(
+            TELEGRAM_TOKEN and PUBLIC_URL
+        ),
+        "ai_provider_configured": bool(
+            GROQ_API_KEY or OPENROUTER_API_KEY
+        )
+    }
+
+
+# =========================
+# TELEGRAM WEBHOOK
+# =========================
 
 @app.post("/telegram/webhook")
-async def telegram_webhook(request: Request):
-    if not BOT_TOKEN or not WEBHOOK_SECRET:
-        raise HTTPException(status_code=503, detail="Telegram environment is not configured")
+async def telegram_webhook(
+    request: Request,
+    x_telegram_bot_api_secret_token: str | None = Header(default=None)
+):
 
-    supplied_secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
-    if not hmac.compare_digest(supplied_secret, WEBHOOK_SECRET):
-        raise HTTPException(status_code=403, detail="Invalid webhook secret")
-
-    update: dict[str, Any] = await request.json()
-    message = update.get("business_message")
-    if not message:
-        return JSONResponse({"ok": True, "ignored": "not a business message"})
-
-    # Only handle ordinary private text messages. Never answer groups, channels,
-    # outgoing messages, media-only messages, or messages without a connection ID.
-    chat = message.get("chat", {})
-    sender = message.get("from", {})
-    connection_id = message.get("business_connection_id")
-    text_in = message.get("text", "").strip()
-    if (
-        chat.get("type") != "private"
-        or message.get("out")
-        or sender.get("is_bot")
-        or not connection_id
-        or not text_in
+    if WEBHOOK_SECRET and not secrets.compare_digest(
+        x_telegram_bot_api_secret_token or "",
+        WEBHOOK_SECRET
     ):
-        return JSONResponse({"ok": True, "ignored": "message outside supported scope"})
+        raise HTTPException(
+            status_code=403,
+            detail="Invalid webhook secret"
+        )
 
-    chat_id = int(chat["id"])
-    message_id = str(message.get("message_id", ""))
-    key = f"{connection_id}:{chat_id}:{message_id}"
-    if already_processed(key):
-        return JSONResponse({"ok": True, "duplicate": True})
-    mark_processed(key)
+    update = await request.json()
 
-    chat_key = f"{connection_id}:{chat_id}"
-    save_message(chat_key, "user", text_in, message_id)
+    update_id = update.get("update_id")
 
-    if not AUTO_REPLY:
-        log.info("DRY RUN: received a message from chat %s; no reply sent", chat_id)
-        return JSONResponse({"ok": True, "dry_run": True})
+    if isinstance(update_id, int):
 
-    try:
-        answer = await generate_reply(chat_key, text_in)
-        await telegram_send(chat_id, answer, connection_id)
-        save_message(chat_key, "assistant", answer)
-        return JSONResponse({"ok": True, "sent": True})
-    except Exception:
-        log.exception("Could not generate/send reply")
-        return JSONResponse({"ok": True, "sent": False, "reason": "AI or Telegram API error"})
+        if update_id in processed_updates:
+            return {"ok": True, "duplicate": True}
 
+        processed_updates.add(update_id)
+
+        if len(processed_updates) > 5000:
+            processed_updates.clear()
+            processed_updates.add(update_id)
+
+    if "business_connection" in update:
+
+        await handle_business_connection(
+            update["business_connection"]
+        )
+
+    elif "business_message" in update:
+
+        await handle_business_message(
+            update["business_message"]
+        )
+
+    return {"ok": True}
+
+
+# =========================
+# ADMIN: SET WEBHOOK
+# =========================
 
 @app.post("/admin/set-webhook")
-async def set_webhook(request: Request):
-    # Protect this setup endpoint with a separate admin key.
-    admin_key = os.getenv("ADMIN_KEY", "")
-    supplied = request.headers.get("X-Admin-Key", "")
-    if not admin_key or not hmac.compare_digest(supplied, admin_key):
-        raise HTTPException(status_code=403, detail="Invalid admin key")
+async def admin_set_webhook(
+    x_admin_key: str | None = Header(default=None)
+):
 
-    body = await request.json()
-    public_url = str(body.get("public_url", "")).rstrip("/")
-    if not public_url.startswith("https://"):
-        raise HTTPException(status_code=400, detail="public_url must start with https://")
+    if not ADMIN_KEY:
+        raise HTTPException(
+            status_code=503,
+            detail="ADMIN_KEY is not configured"
+        )
 
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/setWebhook"
-    payload = {
-        "url": public_url + "/telegram/webhook",
-        "secret_token": WEBHOOK_SECRET,
-        "allowed_updates": ["business_message", "business_connection"],
-        "drop_pending_updates": False,
+    if not secrets.compare_digest(
+        x_admin_key or "",
+        ADMIN_KEY
+    ):
+        raise HTTPException(
+            status_code=403,
+            detail="Invalid admin key"
+        )
+
+    await register_webhook()
+
+    return {
+        "ok": True,
+        "webhook_url": f"{PUBLIC_URL}/telegram/webhook"
     }
-    async with httpx.AsyncClient(timeout=20) as client:
-        response = await client.post(url, json=payload)
-        response.raise_for_status()
-        return response.json()
